@@ -1,4 +1,6 @@
 from typing import Optional
+import argparse
+import ipaddress
 import html2text
 import httpx
 
@@ -9,9 +11,40 @@ from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp import Context
 from pydantic import BaseModel, Field
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urlunparse
 
 mcp = FastMCP("Dash Documentation API")
+_transport: str = "stdio"  # set by main(), controls URL validation strictness
+
+def _is_private_ip(ip: str) -> bool:
+    """Return True if ip is a private/loopback address (uses ipaddress.is_private, requires Python 3.11+)."""
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
+
+
+class LanOnlyMiddleware:
+    """Starlette ASGI middleware that rejects requests from non-private IPs."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] in ("http", "websocket"):
+            client = scope.get("client")
+            ip = client[0] if client else ""
+            if not _is_private_ip(ip):
+                if scope["type"] == "http":
+                    response = (
+                        b"HTTP/1.1 403 Forbidden\r\n"
+                        b"Content-Type: text/plain\r\n"
+                        b"Content-Length: 9\r\n\r\nForbidden"
+                    )
+                    await send({"type": "http.response.start", "status": 403, "headers": []})
+                    await send({"type": "http.response.body", "body": b"Forbidden"})
+                return
+        await self.app(scope, receive, send)
 
 
 async def check_api_health(ctx: Context, port: int) -> bool:
@@ -570,21 +603,34 @@ async def load_documentation_page(ctx: Context, load_url: str) -> DocumentationP
     Returns:
         The documentation page content as plain text with markdown-style links
     """
-    if not load_url.startswith("http://127.0.0.1"):
-        await ctx.error(
-            "Invalid URL: load_url must point to the local Dash API (http://127.0.0.1)"
-        )
+    parsed = urlparse(load_url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        await ctx.error("Invalid URL: load_url must be an http/https URL")
         return DocumentationPage(
             content="",
             load_url=load_url,
-            error="Invalid URL: load_url must point to the local Dash API (http://127.0.0.1). Only URLs returned by search_documentation are supported.",
+            error="Invalid URL: must be an http/https URL returned by search_documentation.",
         )
 
+    if _transport == "stdio":
+        # stdio = local process only; enforce localhost restriction
+        if not load_url.startswith("http://127.0.0.1"):
+            await ctx.error("Invalid URL: load_url must point to the local Dash API (http://127.0.0.1)")
+            return DocumentationPage(
+                content="",
+                load_url=load_url,
+                error="Invalid URL: load_url must point to the local Dash API (http://127.0.0.1). Only URLs returned by search_documentation are supported.",
+            )
+        local_url = load_url
+    else:
+        # HTTP transport: clients are remote, rewrite host to reach local Dash API
+        local_url = urlunparse(parsed._replace(netloc=f"127.0.0.1:{parsed.port or 80}"))
+
     try:
-        await ctx.debug(f"Loading documentation page: {load_url}")
+        await ctx.debug(f"Loading documentation page: {load_url} -> {local_url}")
 
         with httpx.Client(timeout=30.0) as client:
-            response = client.get(load_url)
+            response = client.get(local_url)
             response.raise_for_status()
 
         anchor_id = parse_fragment(load_url)
@@ -630,7 +676,52 @@ async def load_documentation_page(ctx: Context, load_url: str) -> DocumentationP
 
 
 def main():
-    mcp.run()
+    parser = argparse.ArgumentParser(description="Dash MCP Server")
+    parser.add_argument("--host", default="127.0.0.1", help="Host to bind (default: 127.0.0.1, use 0.0.0.0 for LAN access)")
+    parser.add_argument("--port", type=int, default=8000, help="Port to listen on (default: 8000)")
+    parser.add_argument("--transport", choices=["stdio", "streamable-http", "sse"], default="stdio", help="Transport type (default: stdio)")
+    parser.add_argument("--allowed-host", action="append", dest="allowed_hosts", default=[], metavar="HOST", help="Extra allowed Host header value (e.g. dash.mcp.srv:49455). Can be repeated.")
+    args = parser.parse_args()
+
+    import anyio
+    import uvicorn
+
+    global _transport
+    _transport = args.transport
+
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+        return
+
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
+
+    if args.allowed_hosts:
+        from mcp.server.transport_security import TransportSecuritySettings
+        existing = mcp.settings.transport_security
+        mcp.settings.transport_security = TransportSecuritySettings(
+            enable_dns_rebinding_protection=existing.enable_dns_rebinding_protection,
+            allowed_hosts=existing.allowed_hosts + args.allowed_hosts,
+            allowed_origins=existing.allowed_origins,
+        )
+    if args.transport == "streamable-http":
+        base_app = mcp.streamable_http_app()
+    else:  # sse
+        base_app = mcp.sse_app()
+
+    app = LanOnlyMiddleware(base_app)
+
+    async def serve():
+        config = uvicorn.Config(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level=mcp.settings.log_level.lower(),
+        )
+        server = uvicorn.Server(config)
+        await server.serve()
+
+    anyio.run(serve)
 
 
 if __name__ == "__main__":
